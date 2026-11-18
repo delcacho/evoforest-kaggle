@@ -125,9 +125,11 @@ class MutationDocument:
     @classmethod
     def from_yaml(cls, text: str) -> "MutationDocument":
         text = extract_mutation_yaml(text)
-        if _looks_like_paper_style_yaml(text):
-            return _from_paper_style_yaml(text)
-        data = _parse_machine_style_yaml(text)
+        data = _parse_standard_machine_yaml(text)
+        if data is None:
+            if _looks_like_paper_style_yaml(text):
+                return _from_paper_style_yaml(text)
+            data = _parse_machine_style_yaml(text)
 
         add = tuple(
             MutationSpec(
@@ -178,6 +180,43 @@ class MutationDocument:
             remove=remove,
             globals=globals_,
         )
+
+
+_MACHINE_SECTIONS = ("hypotheses", "nodes", "remove", "globals", "add")
+
+
+def _parse_standard_machine_yaml(text: str) -> dict[str, object] | None:
+    """Parse machine-schema mutations written as ordinary block YAML.
+
+    LLMs often emit valid multi-line YAML (``parents:`` followed by ``- x`` lines, nested
+    ``output_contract:`` mappings) that the one-level fallback parser cannot read. Returns
+    None when PyYAML is unavailable, the text is not valid YAML, or it is not the machine
+    schema (e.g. paper-style node-keyed ``add: output: [...]``), so callers fall back.
+    """
+
+    try:
+        import yaml
+    except ImportError:
+        return None
+    try:
+        payload = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(payload, dict) or not any(key in payload for key in _MACHINE_SECTIONS):
+        return None
+    data: dict[str, object] = {"rationale": str(payload.get("rationale") or "")}
+    for section in _MACHINE_SECTIONS:
+        value = payload.get(section)
+        if value is None:
+            value = []
+        if not isinstance(value, list):
+            return None  # node-keyed paper-style add, or something unexpected
+        if section != "hypotheses" and not all(isinstance(row, dict) for row in value):
+            return None
+        data[section] = value
+    if not all(isinstance(row, dict) and "target_node" in row and "alternative_id" in row for row in data["add"]):  # type: ignore[union-attr]
+        return None
+    return data
 
 
 def _parse_machine_style_yaml(text: str) -> dict[str, object]:
@@ -252,6 +291,7 @@ def _parse_machine_yaml_value(value: str) -> object:
 class MutationApplication:
     graph: Graph
     maintenance: MaintenanceReport = field(default_factory=MaintenanceReport)
+    auto_wired_outputs: list[str] = field(default_factory=list)
 
 
 class MutationEngine:
@@ -260,10 +300,14 @@ class MutationEngine:
         registry: PrimitiveRegistry | None = None,
         maintenance: GraphMaintenance | None = None,
         allow_source: bool = False,
+        auto_wire_new_nodes: bool = True,
+        advisory_column_counts: bool = False,
     ) -> None:
         self.registry = registry or PrimitiveRegistry.default()
         self.maintenance = maintenance or GraphMaintenance()
         self.allow_source = bool(allow_source)
+        self.auto_wire_new_nodes = bool(auto_wire_new_nodes)
+        self.advisory_column_counts = bool(advisory_column_counts)
 
     def apply(self, graph: Graph, spec: MutationSpec) -> Graph:
         return self.apply_document(graph, MutationDocument(add=(spec,))).graph
@@ -289,10 +333,44 @@ class MutationEngine:
             explicit_removed.append(f"{remove_spec.target_node}.{remove_spec.alternative_id}")
         for spec in document.add:
             self._apply_add(mutated, spec)
+        auto_wired = self._wire_orphan_nodes(mutated, document) if self.auto_wire_new_nodes else []
         cleaned, report = self.maintenance.clean(mutated)
         cleaned.validate_paper_architecture()
         report.removed_alternatives = explicit_removed + report.removed_alternatives
-        return MutationApplication(graph=cleaned, maintenance=report)
+        return MutationApplication(graph=cleaned, maintenance=report, auto_wired_outputs=auto_wired)
+
+    def _wire_orphan_nodes(self, graph: Graph, document: MutationDocument) -> list[str]:
+        """Connect new intermediate nodes that nothing consumes to the output node.
+
+        LLM engineers often declare a new feature node but forget to route it into an
+        output alternative; maintenance would then prune it as unreachable and the idea would
+        be scored as "no change" without ever being tested. All output alternatives are
+        stacked as Ridge features, so a pass-through output alternative makes the new
+        features *add to* the existing ones instead of being silently dropped.
+        """
+
+        outputs = graph.output_nodes()
+        if len(outputs) != 1:
+            return []
+        output = outputs[0]
+        reachable = graph.reachable_nodes()
+        wired: list[str] = []
+        for node_spec in document.nodes:
+            name = node_spec.name
+            node = graph.nodes.get(name)
+            if node is None or node.kind != "intermediate" or not node.alternatives or name in reachable:
+                continue
+            existing = {alternative.id for alternative in graph.nodes[output].alternatives}
+            alternative_id = f"{name}_passthrough"
+            suffix = 1
+            while alternative_id in existing:
+                suffix += 1
+                alternative_id = f"{name}_passthrough_{suffix}"
+            alternative = self.registry.build("pass_outputs", alternative_id, (name,))
+            alternative.description = f"Auto-wired pass-through of new node {name!r} into the stacked output features."
+            graph.nodes[output].add_alternative(alternative)
+            wired.append(f"{output}.{alternative_id}")
+        return wired
 
     def _apply_add(self, graph: Graph, spec: MutationSpec) -> None:
         if spec.kind != "add_alternative":
@@ -309,6 +387,11 @@ class MutationEngine:
                 raise ValueError("Source-backed mutation alternatives require MutationEngine(allow_source=True).")
             output_contract = default_output_contract(spec.target_node, target_kind)
             output_contract.update(spec.output_contract)
+            if self.advisory_column_counts:
+                # LLMs routinely mis-declare exact widths (copying n_columns: 1 from examples while
+                # returning a whole transformed matrix). Keep the type, drop the exact width.
+                output_contract.pop("n_columns", None)
+                output_contract.setdefault("min_columns", 1)
             alternative = build_source_alternative(
                 spec.alternative_id,
                 spec.parents,

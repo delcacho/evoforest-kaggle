@@ -12,21 +12,38 @@ _NORMAL_EQUATION_MAX_CONDITION_BOUND = 1e6
 _NORMAL_EQUATION_MAX_GRAM_ELEMENTS = 4_000_000
 
 
+# Held-out rows are clipped to the training range of each standardized column, widened by this
+# many training standard deviations. A nearly constant training column (e.g. a saturated sigmoid)
+# otherwise turns a 1e-5 deviation in one held-out row into a value of ~1e4 and a wild prediction.
+EXTRAPOLATION_MARGIN = 3.0
+
+
 @dataclass
 class Standardizer:
     mean: np.ndarray
     scale: np.ndarray
+    low: np.ndarray | None = None
+    high: np.ndarray | None = None
 
     @classmethod
     def fit(cls, x: np.ndarray) -> "Standardizer":
         mean = np.mean(x, axis=0)
         scale = np.std(x, axis=0)
-        scale = np.where(scale < EPS, 1.0, scale)
-        return cls(mean=mean, scale=scale)
+        # Relative threshold: a saturated column (e.g. sigmoid ~ 1 - 1e-9) has a tiny nonzero std made of
+        # rounding noise; scaling it up would turn that noise into a full-strength feature.
+        constant = scale < np.maximum(EPS, 1e-7 * np.maximum(1.0, np.abs(mean)))
+        scale = np.where(constant, 1.0, scale)
+        fitted = (np.asarray(x, dtype=np.float64) - mean) / scale
+        np.nan_to_num(fitted, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        low = np.min(fitted, axis=0) - EXTRAPOLATION_MARGIN if fitted.shape[0] else None
+        high = np.max(fitted, axis=0) + EXTRAPOLATION_MARGIN if fitted.shape[0] else None
+        return cls(mean=mean, scale=scale, low=low, high=high)
 
     def transform(self, x: np.ndarray) -> np.ndarray:
         transformed = (x - self.mean) / self.scale
         np.nan_to_num(transformed, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        if self.low is not None and self.high is not None:
+            np.clip(transformed, self.low, self.high, out=transformed)
         return transformed
 
 
@@ -92,6 +109,50 @@ def _empty_ridge_model(x: np.ndarray, y: np.ndarray, alpha: float, sample_weight
     return RidgeModel(coef=np.zeros(x.shape[1], dtype=np.float64), intercept=y_mean, alpha=float(alpha))
 
 
+def _robust_svd(x: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Thin SVD that falls back to LAPACK gesvd when the default gesdd driver fails to converge.
+
+    gesdd (divide and conquer) occasionally raises on strongly rank-deficient feature matrices
+    (duplicate or saturated columns); gesvd is slower but far more robust.
+    """
+    try:
+        return np.linalg.svd(x, full_matrices=False)
+    except np.linalg.LinAlgError:
+        pass
+    try:
+        import scipy.linalg
+    except ImportError:  # numpy-only install: eigen-decompose the smaller Gram matrix instead.
+        return _svd_via_gram(x)
+    return scipy.linalg.svd(x, full_matrices=False, lapack_driver="gesvd", check_finite=False)
+
+
+def _svd_via_gram(x: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    n, p = x.shape
+    if n >= p:
+        eigval, v = np.linalg.eigh(x.T @ x)
+        order = np.argsort(eigval)[::-1]
+        s = np.sqrt(np.clip(eigval[order], 0.0, None))
+        v = v[:, order]
+        safe = np.where(s > 1e-12 * max(1.0, float(s[0]) if s.size else 1.0), s, np.inf)
+        u = (x @ v) / safe
+        return u, s, v.T
+    eigval, u = np.linalg.eigh(x @ x.T)
+    order = np.argsort(eigval)[::-1]
+    s = np.sqrt(np.clip(eigval[order], 0.0, None))
+    u = u[:, order]
+    safe = np.where(s > 1e-12 * max(1.0, float(s[0]) if s.size else 1.0), s, np.inf)
+    vt = (u.T @ x) / safe[:, None]
+    return u, s, vt
+
+
+def robust_singular_values(x: np.ndarray) -> np.ndarray:
+    try:
+        return np.linalg.svd(x, full_matrices=False, compute_uv=False)
+    except np.linalg.LinAlgError:
+        small = x.T @ x if x.shape[0] >= x.shape[1] else x @ x.T
+        return np.sqrt(np.clip(np.sort(np.linalg.eigvalsh(small))[::-1], 0.0, None))
+
+
 def _weighted_svd(x: np.ndarray, y: np.ndarray, sample_weight: np.ndarray | None) -> _WeightedSVD:
     xc, yc, x_mean, y_mean, weights = _weighted_center(x, y, sample_weight)
     if np.all(weights == 1.0):
@@ -102,7 +163,7 @@ def _weighted_svd(x: np.ndarray, y: np.ndarray, sample_weight: np.ndarray | None
         sqrt_w = np.sqrt(weights)
         xw = xc * sqrt_w[:, None]
         yw = yc * sqrt_w
-    u, s, vt = np.linalg.svd(xw, full_matrices=False)
+    u, s, vt = _robust_svd(xw)
     return _WeightedSVD(
         u=u,
         s=s,

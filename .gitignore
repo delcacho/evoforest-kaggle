@@ -6,3 +6,6 @@ __pycache__/
 *.egg-info/
 runs/
 .DS_Store
+examples/kaggle_house_prices/data/
+examples/kaggle_house_prices/submissions/
+*.zip

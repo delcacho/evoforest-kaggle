@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
+from dataclasses import replace as dataclass_replace
 import json
 import os
 import pathlib
@@ -21,12 +22,14 @@ from evoforest_arch.hypotheses import Hypothesis
 from evoforest_arch.llm_budget import LLMBudget
 from evoforest_arch.mutations import MutationDocument, RemoveSpec, validate_mutation_document_architecture
 from evoforest_arch.primitives import PrimitiveRegistry
+from evoforest_arch.source import ALLOWED_BUILTIN_CALLS, ALLOWED_MATH_CALLS, ALLOWED_NUMPY_CALLS
 
 
 DEFAULT_ISLAND_TEMPERATURES = (0.35, 0.5, 0.6, 0.75)
 DEFAULT_ENV_FILE = pathlib.Path(".env")
 DEFAULT_GEMINI_MODEL = "gemini-3.1-flash-lite"
 SUPPORTED_LLM_PROVIDERS = ("openai", "claude", "gemini")
+OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
 RETRYABLE_LLM_HTTP_STATUSES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
 
@@ -138,6 +141,31 @@ def llm_provider_from_env(path: str | pathlib.Path | None = DEFAULT_ENV_FILE, *,
     return normalized
 
 
+def engineer_client_from_env(client: LLMClient) -> LLMClient:
+    """Optionally give the engineer its own request settings (OpenAI-compatible clients only).
+
+    EVOFOREST_ENGINEER_EXTRA_BODY / EVOFOREST_ENGINEER_MAX_TOKENS override the shared
+    EVOFOREST_OPENAI_EXTRA_BODY / EVOFOREST_LLM_MAX_TOKENS for engineer calls, e.g. to let a
+    local Qwen think before writing code while the scientist and memorandum stay fast.
+    """
+
+    if not isinstance(client, OpenAILLMClient):
+        return client
+    extra = _first_env(("EVOFOREST_ENGINEER_EXTRA_BODY",))
+    max_tokens = _optional_env_int("EVOFOREST_ENGINEER_MAX_TOKENS")
+    if not extra and max_tokens is None:
+        return client
+    if extra:
+        parsed = json.loads(extra)
+        if not isinstance(parsed, dict):
+            raise ValueError("EVOFOREST_ENGINEER_EXTRA_BODY must be a JSON object.")
+    return dataclass_replace(
+        client,
+        extra_body_json=extra or client.extra_body_json,
+        max_tokens_override=max_tokens if max_tokens is not None else client.max_tokens_override,
+    )
+
+
 def llm_client_from_env(env_file: str | pathlib.Path | None = DEFAULT_ENV_FILE) -> LLMClient:
     provider = llm_provider_from_env(env_file, required=True)
     if provider == "openai":
@@ -156,14 +184,26 @@ class OpenAILLMClient:
     api_key: str
     model: str
     timeout_seconds: float = 120.0
+    base_url: str = "https://api.openai.com/v1"
+    # Per-client overrides (e.g. a thinking-enabled engineer); None falls back to the env vars.
+    extra_body_json: str | None = None
+    max_tokens_override: int | None = None
 
     @classmethod
     def from_env(cls, env_file: str | pathlib.Path | None = DEFAULT_ENV_FILE) -> "OpenAILLMClient":
         load_env_file(env_file)
+        base_url = _first_env(("EVOFOREST_OPENAI_BASE_URL", "OPENAI_BASE_URL")) or OPENAI_DEFAULT_BASE_URL
+        is_custom_endpoint = base_url.rstrip("/") != OPENAI_DEFAULT_BASE_URL
+        api_key = (
+            _first_env(("OPENAI_API_KEY", "EVOFOREST_OPENAI_API_KEY")) or "local"
+            if is_custom_endpoint
+            else _required_env(("OPENAI_API_KEY", "EVOFOREST_OPENAI_API_KEY"), "openai")
+        )
         return cls(
-            api_key=_required_env(("OPENAI_API_KEY", "EVOFOREST_OPENAI_API_KEY"), "openai"),
+            api_key=api_key,
             model=_required_env(("EVOFOREST_LLM_MODEL", "EVOFOREST_OPENAI_MODEL"), "openai"),
             timeout_seconds=_env_float("EVOFOREST_LLM_TIMEOUT_SECONDS", 120.0),
+            base_url=base_url,
         )
 
     def complete(self, system_prompt: str, user_prompt: str, *, temperature: float = 0.0) -> str:
@@ -175,16 +215,23 @@ class OpenAILLMClient:
                 {"role": "user", "content": user_prompt},
             ],
         }
-        max_tokens = _optional_env_int("EVOFOREST_LLM_MAX_TOKENS")
+        max_tokens = self.max_tokens_override if self.max_tokens_override is not None else _optional_env_int("EVOFOREST_LLM_MAX_TOKENS")
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
+        extra_body = self.extra_body_json if self.extra_body_json is not None else _first_env(("EVOFOREST_OPENAI_EXTRA_BODY",))
+        if extra_body:
+            # e.g. {"chat_template_kwargs": {"enable_thinking": false}} for local Qwen3 servers.
+            extra = json.loads(extra_body)
+            if not isinstance(extra, dict):
+                raise ValueError("EVOFOREST_OPENAI_EXTRA_BODY must be a JSON object.")
+            payload.update(extra)
         data = _post_json(
-            "https://api.openai.com/v1/chat/completions",
+            f"{self.base_url.rstrip('/')}/chat/completions",
             payload,
             headers={"Authorization": f"Bearer {self.api_key}"},
             timeout_seconds=self.timeout_seconds,
         )
-        return _extract_openai_content(data)
+        return _strip_reasoning_blocks(_extract_openai_content(data))
 
 
 @dataclass(frozen=True)
@@ -354,6 +401,10 @@ class PromptBuilder:
         hypothesis_text = "\n".join(f"- {item.to_text()}" for item in hypotheses) or "- No hypotheses supplied."
         system = "\n".join(
             [
+                "===================== TASK CONTEXT =====================",
+                self.task_context,
+                "========================================================",
+                "",
                 self.global_rules(),
                 "",
                 "==== SCIENTIST HYPOTHESES ====",
@@ -413,10 +464,16 @@ class PromptBuilder:
                     "  \"parents\": [\"explicit_parent_node\"]",
                     "  \"global_refs\": [\"optional_existing_or_new_global\"]",
                     "  \"node_kind\": \"intermediate|callable|output|fitting\"",
-                    "  \"output_contract\": {\"type\": \"feature_block\", \"n_columns\": 1, \"differentiable\": true}",
+                    "  \"output_contract\": {\"type\": \"feature_block\", \"min_columns\": 1, \"differentiable\": true}  (widths are taken from the actual output; do not declare n_columns)",
                     "  \"torch_source\": \"lambda ctx, values: <optional differentiable torch expression>\"",
                     "The lambda receives ctx and values, where values maps parent node names to evaluated parent outputs.",
                     "Available lambda symbols: np, math, FeatureBlock, CallableFamily, ResidualWeightRule.",
+                    "Feature lambdas may return a plain 1-D/2-D numpy array (preferred) or FeatureBlock(array, names) with exactly one name string per column; FeatureBlock(array) without names fails.",
+                    f"The sandbox only allows these calls: np.{{{', '.join(sorted(ALLOWED_NUMPY_CALLS))}}}; math.{{{', '.join(sorted(ALLOWED_MATH_CALLS))}}}; builtins {{{', '.join(sorted(ALLOWED_BUILTIN_CALLS))}}}. Anything else (e.g. np.exp2, np.arctan, np.einsum, np.random) is rejected; use operators (*, +, -, /, **, >) or compose from the allowed calls.",
+                    "When indexing input columns, use the column index -> feature mapping from the task context exactly; never guess indices.",
+                    "Graph semantics: alternatives inside one intermediate node COMPETE (the configuration search keeps only one per node), while all alternatives of the output node are STACKED as Ridge features.",
+                    "To ADD new features on top of the current ones, declare a new intermediate node, add your source alternative to it, and add an output alternative (primitive pass_outputs) whose parents include that node. A new node that no output consumes is auto-wired as a pass-through output alternative.",
+                    "Only add an alternative to an existing intermediate node when you intend it to REPLACE that node's current choice.",
                     "Use task inputs from ctx.read_input(...) only when they are part of the current task schema.",
                     "Paper-style shorthand lambdas infer parents from values['parent'] and global_refs from ctx.globals.get('name'); use the object form when shape contracts or torch_source matter.",
                 ]
@@ -1099,6 +1156,15 @@ def _retry_after_seconds(exc: urllib.error.HTTPError | None) -> float | None:
         return None
 
 
+def _strip_reasoning_blocks(text: str) -> str:
+    """Drop <think>...</think> blocks that local reasoning models (e.g. Qwen3) may inline."""
+
+    stripped = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    if "</think>" in stripped:  # opening tag consumed by the chat template
+        stripped = stripped.split("</think>", 1)[1]
+    return stripped.strip()
+
+
 def _extract_openai_content(data: object) -> str:
     if not isinstance(data, dict):
         raise ValueError("LLM response JSON must be an object.")
@@ -1205,6 +1271,14 @@ def _stringify_content(content: object) -> str:
 
 def _normalize_provider(provider: str) -> str:
     return provider.strip().lower().replace("_", "-")
+
+
+def _first_env(names: tuple[str, ...]) -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value.strip()
+    return ""
 
 
 def _required_env(names: tuple[str, ...], provider: str) -> str:

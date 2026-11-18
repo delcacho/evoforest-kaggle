@@ -5,6 +5,7 @@ import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
+import math
 import multiprocessing as mp
 import os
 import pathlib
@@ -48,7 +49,44 @@ PAPER_PROFILE = "paper"
 SUPPORTED_PRODUCTION_PROFILES = (PRODUCTION_PROFILE, PAPER_PROFILE)
 VALIDATION_PROMOTION_POLICY = "validation_gated"
 CV_SCORE_PROMOTION_POLICY = "cv_score"
-SUPPORTED_PROMOTION_POLICIES = (VALIDATION_PROMOTION_POLICY, CV_SCORE_PROMOTION_POLICY)
+CV_SIGN_TEST_PROMOTION_POLICY = "cv_sign_test"
+SUPPORTED_PROMOTION_POLICIES = (VALIDATION_PROMOTION_POLICY, CV_SCORE_PROMOTION_POLICY, CV_SIGN_TEST_PROMOTION_POLICY)
+CV_PROMOTION_POLICIES = (CV_SCORE_PROMOTION_POLICY, CV_SIGN_TEST_PROMOTION_POLICY)
+CV_ACCEPTANCE_POLICY_NAMES = ("paper_cv_score_improvement", "cv_fold_sign_test")
+
+
+def fold_sign_test(
+    candidate_fold_scores: object,
+    best_fold_scores: object,
+    *,
+    alpha: float,
+    tie_tolerance: float = 1e-12,
+) -> dict[str, object]:
+    """One-sided sign test that the candidate beats the incumbent across CV folds.
+
+    Scores are higher-is-better and must come from the same fold assignment. Ties (within
+    ``tie_tolerance``) are dropped, as in the standard sign test. Folds share training rows,
+    so the p-value is optimistic; it is still far stricter about lucky averages than a
+    plain mean comparison.
+    """
+
+    candidate = np.asarray(candidate_fold_scores, dtype=np.float64).reshape(-1)
+    best = np.asarray(best_fold_scores, dtype=np.float64).reshape(-1)
+    if candidate.size == 0 or candidate.shape != best.shape:
+        return {"accept": False, "reason": "fold_score_mismatch", "wins": 0, "losses": 0, "ties": 0, "p_value": 1.0, "alpha": float(alpha)}
+    delta = candidate - best
+    wins = int(np.sum(delta > tie_tolerance))
+    losses = int(np.sum(delta < -tie_tolerance))
+    n = wins + losses
+    p_value = float(sum(math.comb(n, k) for k in range(wins, n + 1)) / (2**n)) if n else 1.0
+    return {
+        "accept": bool(n > 0 and wins > losses and p_value <= float(alpha)),
+        "wins": wins,
+        "losses": losses,
+        "ties": int(candidate.size - n),
+        "p_value": p_value,
+        "alpha": float(alpha),
+    }
 PAPER_PROFILE_STEPS = 600
 
 
@@ -254,6 +292,11 @@ class ProductionConfig:
     promotion_policy: str = VALIDATION_PROMOTION_POLICY
     min_train_improvement: float = 1e-6
     min_validation_improvement: float = 1e-6
+    # cv_sign_test: one-sided fold sign-test significance level.
+    sign_test_alpha: float = 0.05
+    # CV-based policies: veto candidates whose validation score is more than this fraction
+    # worse than the incumbent's (catches features that blow up on unseen rows). <=0 disables.
+    max_validation_regression: float = 0.10
     allow_source_mutations: bool = False
     islands: int = PAPER_ISLAND_COUNT
     async_islands: bool = True
@@ -347,6 +390,8 @@ def paper_profile_defaults() -> dict[str, Any]:
         "promotion_policy": CV_SCORE_PROMOTION_POLICY,
         "min_train_improvement": 0.0,
         "min_validation_improvement": 0.0,
+        # The paper promotes on CV score alone; validation is reported, never used as a veto.
+        "max_validation_regression": 0.0,
     }
 
 
@@ -924,7 +969,7 @@ class ProductionIslandWorker:
 
     def _frontier_score(self, train_result: EvaluationResult, validation_result: EvaluationResult) -> float:
         acceptance = dict(self.manifest.get("acceptance", {}))
-        if str(acceptance.get("policy", "")) == "paper_cv_score_improvement":
+        if str(acceptance.get("policy", "")) in CV_ACCEPTANCE_POLICY_NAMES:
             return float(train_result.score)
         return float(validation_result.score)
 
@@ -1468,12 +1513,15 @@ class ProductionEvolutionRunner:
             raise ValueError(f"Unsupported production profile {self.config.profile!r}; expected one of {', '.join(SUPPORTED_PRODUCTION_PROFILES)}.")
         if self.config.promotion_policy not in SUPPORTED_PROMOTION_POLICIES:
             raise ValueError(f"Unsupported promotion policy {self.config.promotion_policy!r}; expected one of {', '.join(SUPPORTED_PROMOTION_POLICIES)}.")
+        if not 0.0 < float(self.config.sign_test_alpha) < 1.0:
+            raise ValueError("sign_test_alpha must be between 0 and 1.")
         self.graph = graph or build_seed_graph(self.task_schema)
         self.evaluator = RidgeEvaluator(**self._evaluator_config_for_task())
         self.evaluator.task_schema = self.task_schema
         self.mutation_engine = MutationEngine(
             registry=PrimitiveRegistry.for_task(self.task_schema),
             allow_source=config.allow_source_mutations,
+            advisory_column_counts=True,  # LLM-declared widths are guesses; validate the type only.
         )
         if scientist is None or engineer is None or memorandum_agent is None:
             raise ValueError(
@@ -2131,6 +2179,7 @@ class ProductionEvolutionRunner:
             mutation_engine=MutationEngine(
                 registry=self.mutation_engine.registry,
                 allow_source=self.mutation_engine.allow_source,
+                advisory_column_counts=self.mutation_engine.advisory_column_counts,
             ),
             scientist=self.scientist,
             engineer=self.engineer,
@@ -2533,9 +2582,41 @@ class ProductionEvolutionRunner:
         policy = str(acceptance.get("policy", self._acceptance_policy_name()))
         min_train = float(acceptance.get("min_train_improvement", self.config.min_train_improvement))
         min_validation = float(acceptance.get("min_validation_improvement", self.config.min_validation_improvement))
-        if policy == "paper_cv_score_improvement":
-            return train_delta > min_train
+        if policy in CV_ACCEPTANCE_POLICY_NAMES:
+            max_regression = float(acceptance.get("max_validation_regression", self.config.max_validation_regression))
+            best_validation = float(context.best_validation_result.score)
+            regression = (best_validation - float(validation_result.score)) / max(abs(best_validation), 1e-12)
+            vetoed = max_regression > 0.0 and regression > max_regression
+            detail: dict[str, object] = {
+                "policy": policy,
+                "train_delta": train_delta,
+                "validation_delta": validation_delta,
+                "validation_regression": regression,
+                "validation_vetoed": bool(vetoed),
+            }
+            if policy == "cv_fold_sign_test":
+                alpha = float(acceptance.get("sign_test_alpha", self.config.sign_test_alpha))
+                test = fold_sign_test(
+                    dict(train_result.diagnostics.get("folds", {})).get("score", []),
+                    dict(context.best_train_result.diagnostics.get("folds", {})).get("score", []),
+                    alpha=alpha,
+                )
+                detail["sign_test"] = test
+                accepted = bool(test["accept"]) and train_delta > min_train and not vetoed
+            else:
+                accepted = train_delta > min_train and not vetoed
+            detail["accepted"] = accepted
+            self._record_promotion_decision(context, detail)
+            return accepted
         return train_delta > min_train and validation_delta > min_validation
+
+    @staticmethod
+    def _record_promotion_decision(context: ProductionContext, detail: dict[str, object]) -> None:
+        try:
+            with (context.run_dir / "promotion_decisions.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"timestamp_utc": datetime.now(timezone.utc).isoformat(), **detail}, sort_keys=True) + "\n")
+        except OSError:
+            pass
 
     def _frontier_score(
         self,
@@ -2544,7 +2625,7 @@ class ProductionEvolutionRunner:
         validation_result: EvaluationResult,
     ) -> float:
         acceptance = dict(context.manifest.get("acceptance", {}))
-        if str(acceptance.get("policy", self._acceptance_policy_name())) == "paper_cv_score_improvement":
+        if str(acceptance.get("policy", self._acceptance_policy_name())) in CV_ACCEPTANCE_POLICY_NAMES:
             return float(train_result.score)
         return float(validation_result.score)
 
@@ -2555,6 +2636,8 @@ class ProductionEvolutionRunner:
     def _acceptance_policy_name(self) -> str:
         if self.config.promotion_policy == CV_SCORE_PROMOTION_POLICY:
             return "paper_cv_score_improvement"
+        if self.config.promotion_policy == CV_SIGN_TEST_PROMOTION_POLICY:
+            return "cv_fold_sign_test"
         if self.config.min_train_improvement < 0.0:
             return "validation_improvement_with_train_regression_floor"
         return "train_improvement_and_validation_improvement"
@@ -2623,13 +2706,15 @@ class ProductionEvolutionRunner:
             },
             "acceptance": {
                 "policy": self._acceptance_policy_name(),
-                "metric": "train_cv_score" if self.config.promotion_policy == CV_SCORE_PROMOTION_POLICY else "validation_score",
+                "metric": "train_cv_score" if self.config.promotion_policy in CV_PROMOTION_POLICIES else "validation_score",
                 "validation_gate": self.config.promotion_policy == VALIDATION_PROMOTION_POLICY,
                 "min_train_improvement": float(self.config.min_train_improvement),
                 "min_validation_improvement": float(self.config.min_validation_improvement),
+                "sign_test_alpha": float(self.config.sign_test_alpha),
+                "max_validation_regression": float(self.config.max_validation_regression),
                 "validation_config": (
-                    "reported_with_candidate_train_best_config_not_used_for_promotion"
-                    if self.config.promotion_policy == CV_SCORE_PROMOTION_POLICY
+                    "reported_with_candidate_train_best_config_used_only_for_regression_veto"
+                    if self.config.promotion_policy in CV_PROMOTION_POLICIES
                     else "candidate_train_best_config"
                 ),
             },

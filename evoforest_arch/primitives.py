@@ -6,7 +6,7 @@ from typing import Callable
 
 import numpy as np
 
-from evoforest_arch.graph import CallableFamily, EvalContext, FeatureBlock, NodeAlternative, ResidualWeightRule
+from evoforest_arch.graph import CallableFamily, EvalContext, FeatureBlock, NodeAlternative, ResidualWeightRule, as_feature_block
 from evoforest_arch.task import TaskSchema
 
 
@@ -967,7 +967,8 @@ def clipped_linear_callable_factory(alternative_id: str, parents: tuple[str, ...
 
 
 def combine_blocks(values: dict[str, object], parents: tuple[str, ...]) -> FeatureBlock:
-    blocks = [value if isinstance(value, FeatureBlock) else FeatureBlock(np.asarray(value), [parent]) for parent, value in ((parent, values[parent]) for parent in parents)]
+    # Plain arrays (e.g. multi-column source lambdas) get one name per column, not one per parent.
+    blocks = [value if isinstance(value, FeatureBlock) else as_feature_block(value, parent) for parent, value in ((parent, values[parent]) for parent in parents)]
     return FeatureBlock(
         np.column_stack([block.values for block in blocks]),
         [name for block in blocks for name in block.names],

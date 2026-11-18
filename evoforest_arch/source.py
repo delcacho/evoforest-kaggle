@@ -40,7 +40,7 @@ SAFE_BUILTINS: dict[str, object] = {
 class SourceSandboxPolicy:
     enabled: bool = True
     timeout_seconds: float = 2.0
-    memory_mb: int = 512
+    memory_mb: int = 8192  # RLIMIT_AS counts virtual address space; numpy/BLAS reserve a lot of it
     cpu_seconds: int = 2
     deterministic_trials: int = 2
 
@@ -72,13 +72,25 @@ def build_source_alternative(
     torch_source = torch_source.strip()
     _validate_lambda_ast(source)
     explicit_torch_source = bool(torch_source)
+    torch_source_rejected = ""
+    if torch_source:
+        try:
+            _validate_lambda_ast(torch_source, backend="torch")
+        except ValueError as error:
+            # The torch path is optional (only used by global refinement); a bad one must not
+            # sink an otherwise valid NumPy feature. Fall back to auto-derivation below.
+            torch_source_rejected = str(error)
+            torch_source = ""
+            explicit_torch_source = False
     if not torch_source and node_kind in {"", "intermediate", "output"}:
         torch_source = _derive_torch_source(source)
-    if torch_source:
-        _validate_lambda_ast(torch_source, backend="torch")
     policy = sandbox_policy or SourceSandboxPolicy()
     contract = default_output_contract("", node_kind)
     contract.update(output_contract or {})
+    if torch_source_rejected:
+        contract["torch_source_rejected"] = torch_source_rejected
+        if not torch_source:
+            contract["differentiable"] = False
     if bool(contract.get("differentiable", False)) and not torch_source:
         raise ValueError("Source alternatives with output_contract.differentiable=true require torch_source.")
     if torch_source:
@@ -190,12 +202,27 @@ class _TorchSourceTransformer(ast.NodeTransformer):
         return node
 
 
+def _lenient_feature_block(values: object, names: object = None) -> FeatureBlock:
+    """FeatureBlock for LLM-written lambdas: missing or miscounted names become generic ones.
+
+    Feature names are labels for diagnostics only, so a wrong count should not reject an
+    otherwise valid feature. Library primitives keep using the strict FeatureBlock.
+    """
+
+    array = np.asarray(values, dtype=np.float64)
+    n_columns = 1 if array.ndim == 1 else int(array.shape[1]) if array.ndim == 2 else -1
+    name_list = [str(name) for name in names] if isinstance(names, (list, tuple)) else []
+    if len(name_list) != n_columns and n_columns >= 0:
+        name_list = [f"f{index}" for index in range(n_columns)]
+    return FeatureBlock(array, name_list)
+
+
 def _source_namespace() -> dict[str, object]:
     return {
         "__builtins__": SAFE_BUILTINS,
         "np": np,
         "math": math,
-        "FeatureBlock": FeatureBlock,
+        "FeatureBlock": _lenient_feature_block,
         "CallableFamily": CallableFamily,
         "ResidualWeightRule": ResidualWeightRule,
     }
@@ -526,6 +553,22 @@ ALLOWED_NUMPY_CALLS = {
     "sum",
     "sort",
     "zeros",
+    # Pure elementwise math commonly written by LLM engineers; no I/O or object access.
+    "add",
+    "cos",
+    "divide",
+    "exp",
+    "expm1",
+    "hstack",
+    "log1p",
+    "multiply",
+    "power",
+    "sign",
+    "sin",
+    "sqrt",
+    "subtract",
+    "tanh",
+    "where",
 }
 ALLOWED_MATH_CALLS = {"ceil", "exp", "floor", "log", "sqrt"}
 ALLOWED_TORCH_CALLS = {
@@ -548,6 +591,24 @@ ALLOWED_TORCH_CALLS = {
     "sum",
     "zeros_like",
     "ones_like",
+    "div",
+    "mul",
+    "sub",
+    "add",
+    "cos",
+    "divide",
+    "exp",
+    "expm1",
+    "hstack",
+    "log1p",
+    "multiply",
+    "pow",
+    "sign",
+    "sin",
+    "sqrt",
+    "subtract",
+    "tanh",
+    "where",
 }
 ALLOWED_BUILTIN_CALLS = {"FeatureBlock", "float", "int", "len", "max", "min", "abs", "sum", "round", "list", "tuple", "bool"}
 ALLOWED_DATA_ATTRIBUTES = {"values", "shape", "T"}

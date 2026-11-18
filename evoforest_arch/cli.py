@@ -10,6 +10,7 @@ from evoforest_arch.datasets import load_dataset_bundle
 from evoforest_arch.evaluator import RidgeEvaluator
 from evoforest_arch.evolution import EvolutionLoop
 from evoforest_arch.llm import (
+    engineer_client_from_env,
     DEFAULT_ISLAND_TEMPERATURES,
     GeminiLLMClient,
     LLMEngineerAgent,
@@ -25,6 +26,7 @@ from evoforest_arch.mutations import MutationEngine
 from evoforest_arch.primitives import PrimitiveRegistry
 from evoforest_arch.production import (
     CV_SCORE_PROMOTION_POLICY,
+    CV_SIGN_TEST_PROMOTION_POLICY,
     PAPER_PROFILE,
     PRODUCTION_PROFILE,
     ProductionConfig,
@@ -75,6 +77,8 @@ PRODUCTION_CLI_DEFAULTS = {
     "promotion_policy": VALIDATION_PROMOTION_POLICY,
     "min_train_improvement": 1e-6,
     "min_validation_improvement": 1e-6,
+    "sign_test_alpha": 0.05,
+    "max_validation_regression": 0.10,
     "islands": 4,
     "async_islands": True,
     "island_workers": None,
@@ -102,6 +106,7 @@ def evolve_profile_defaults(profile: str) -> dict[str, object]:
             "promotion_policy": paper["promotion_policy"],
             "min_train_improvement": paper["min_train_improvement"],
             "min_validation_improvement": paper["min_validation_improvement"],
+            "max_validation_regression": paper["max_validation_regression"],
             "islands": paper["islands"],
             "async_islands": paper["async_islands"],
             "island_workers": paper["island_workers"],
@@ -215,7 +220,14 @@ def main(argv: list[str] | None = None) -> int:
     evolve.add_argument("--no-feature-pool-diagnostics", dest="feature_pool_diagnostics", action="store_false")
     evolve.add_argument("--retain-feature-matrix", dest="retain_feature_matrix", action="store_true", default=None)
     evolve.add_argument("--no-retain-feature-matrix", dest="retain_feature_matrix", action="store_false")
-    evolve.add_argument("--promotion-policy", choices=(VALIDATION_PROMOTION_POLICY, CV_SCORE_PROMOTION_POLICY), default=None)
+    evolve.add_argument("--promotion-policy", choices=(VALIDATION_PROMOTION_POLICY, CV_SCORE_PROMOTION_POLICY, CV_SIGN_TEST_PROMOTION_POLICY), default=None)
+    evolve.add_argument("--sign-test-alpha", type=float, default=None, help="cv_sign_test: one-sided fold sign-test significance level (default 0.05).")
+    evolve.add_argument(
+        "--max-validation-regression",
+        type=float,
+        default=None,
+        help="CV-based policies: reject candidates whose validation score is this fraction worse than the incumbent (default 0.10; <=0 disables).",
+    )
     evolve.add_argument("--min-train-improvement", type=float, default=None)
     evolve.add_argument("--min-validation-improvement", type=float, default=None)
     evolve.add_argument("--allow-source-mutations", action="store_true")
@@ -385,6 +397,8 @@ def run_evolve(args: argparse.Namespace) -> int:
         promotion_policy=args.promotion_policy,
         min_train_improvement=args.min_train_improvement,
         min_validation_improvement=args.min_validation_improvement,
+        sign_test_alpha=args.sign_test_alpha,
+        max_validation_regression=args.max_validation_regression,
         allow_source_mutations=args.allow_source_mutations,
         islands=args.islands,
         async_islands=args.async_islands,
@@ -441,7 +455,7 @@ def build_llm_agents(
             island_temperatures=args.llm_island_temperatures,
         ),
         LLMEngineerAgent(
-            client,
+            engineer_client_from_env(client),
             prompt_builder=prompt_builder,
             registry=registry,
             temperature=args.llm_engineer_temperature,

@@ -13,7 +13,7 @@ import numpy as np
 from evoforest_arch.evaluation_cache import PersistentEvaluationCache, fingerprint_callable, fingerprint_inputs, fingerprint_value
 from evoforest_arch.graph import EvalContext, EvaluationKeyFingerprints, Graph, ResidualWeightRule
 from evoforest_arch.metrics import DEFAULT_SCORER, FoldStrategy, ScoreFunction, TaskScorer, coerce_fold_strategy, coerce_scorer, safe_corr
-from evoforest_arch.readout import DEFAULT_ALPHAS, RidgeModel, Standardizer, combine_sample_weights, fit_ridge_screening, normalize_sample_weight, select_alpha_and_fit_ridge
+from evoforest_arch.readout import DEFAULT_ALPHAS, RidgeModel, Standardizer, robust_singular_values, combine_sample_weights, fit_ridge_screening, normalize_sample_weight, select_alpha_and_fit_ridge
 from evoforest_arch.task import TaskSchema
 
 
@@ -1680,7 +1680,7 @@ def effective_rank(x: np.ndarray) -> float:
     if not np.any(valid):
         return 0.0
     normalized = centered[:, valid] / scale[valid].reshape(1, -1)
-    singular_values = np.linalg.svd(normalized, full_matrices=False, compute_uv=False)
+    singular_values = robust_singular_values(normalized)
     total = float(np.sum(singular_values))
     if total < 1e-12:
         return 0.0
@@ -1730,7 +1730,7 @@ def feature_correlation_summary(x: np.ndarray, names: list[str], *, threshold: f
 
     normalized = (x[:, valid_indices] - mean[:, valid_indices]) / scale[valid_indices].reshape(1, -1)
     normalized = np.nan_to_num(normalized, nan=0.0, posinf=0.0, neginf=0.0)
-    singular_values = np.linalg.svd(normalized, full_matrices=False, compute_uv=False)
+    singular_values = robust_singular_values(normalized)
     total = float(np.sum(singular_values))
     if total < 1e-12:
         rank = 0.0

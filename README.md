@@ -1,10 +1,114 @@
 # EvoForest Reimplementation
 
+> Based on [Gabriel Kahen's evoforest-reimplementation](https://github.com/Gabriel-Kahen/evoforest-reimplementation) (MIT).
+> This fork adds a fold sign-test acceptance policy, support for local OpenAI-compatible LLMs
+> (e.g. Qwen on vLLM or llama.cpp), readout robustness fixes and a Kaggle House Prices experiment.
+> See [docs/house_prices_experiment.md](docs/house_prices_experiment.md).
+
 This repo recreates the software architecture described in
 the EvoForest paper. It is not a reproduction of the authors' private evolved graph,
 their 600-step run, or their reported score.
 
 See the paper here: https://arxiv.org/abs/2604.19761
+
+## What this fork adds
+
+The rest of this README documents the original architecture. This section lists what
+was added on top of it. The full experiment report, with results and lessons, is in
+[docs/house_prices_experiment.md](docs/house_prices_experiment.md).
+
+### 1. Sign-test promotion policy (`--promotion-policy cv_sign_test`)
+
+The paper-style `cv_score` policy promotes a candidate whenever its mean CV score
+improves, which over hundreds of steps accumulates noise. `cv_sign_test` instead:
+
+- compares candidate and incumbent **fold by fold**, on the same fold assignment;
+- drops ties and runs a **one-sided binomial sign test**. With 10 folds and
+  `--sign-test-alpha 0.05` that means winning at least 9 of 10 folds; 0.10 means 8/10;
+- **vetoes** candidates whose validation score is more than `--max-validation-regression`
+  worse than the incumbent's (default 0.10; `<= 0` disables). The veto also applies to
+  `cv_score`, except in `--profile paper`, which keeps the paper's no-veto behaviour;
+- appends every decision (wins, losses, p-value, train/validation deltas, veto) to
+  `<run>/promotion_decisions.jsonl`.
+
+```bash
+evoforest-arch evolve ... --folds 10 --promotion-policy cv_sign_test \
+  --sign-test-alpha 0.05 --max-validation-regression 0.10
+```
+
+The fold p-value is optimistic because folds share training rows. Use at least about
+9 folds, or significance is unreachable.
+
+### 2. Local OpenAI-compatible LLMs
+
+Any OpenAI-compatible server works: llama.cpp `llama-server`, vLLM, Ollama and similar.
+No API key is needed for a non-OpenAI base URL. Example `.env`:
+
+```bash
+EVOFOREST_LLM_PROVIDER=openai
+EVOFOREST_OPENAI_BASE_URL=http://127.0.0.1:8080/v1
+EVOFOREST_LLM_MODEL=qwen
+EVOFOREST_LLM_TIMEOUT_SECONDS=600
+# Extra JSON merged into every request, e.g. disable Qwen3 thinking:
+EVOFOREST_OPENAI_EXTRA_BODY={"chat_template_kwargs": {"enable_thinking": false}}
+# Optional engineer-only overrides (e.g. let only the code-writing agent think):
+# EVOFOREST_ENGINEER_EXTRA_BODY={"chat_template_kwargs": {"enable_thinking": true}}
+# EVOFOREST_ENGINEER_MAX_TOKENS=16384
+EVOFOREST_LLM_INPUT_PRICE_USD_PER_MILLION_TOKENS=0
+EVOFOREST_LLM_OUTPUT_PRICE_USD_PER_MILLION_TOKENS=0
+```
+
+Inline `<think>...</think>` blocks are stripped from responses.
+
+### 3. More forgiving handling of LLM-written mutations
+
+| Change | Why |
+|---|---|
+| Standard block YAML is parsed with PyYAML first (new dependency `pyyaml`), then the original line parser | Models emit valid multi-line YAML that the one-level parser rejected |
+| Declared `n_columns` is advisory in production runs (width is taken from the actual output) | Models copied `n_columns: 1` from the prompt example while returning whole matrices |
+| `FeatureBlock(...)` inside lambdas tolerates missing or miscounted names | Names are only diagnostic labels |
+| An invalid optional `torch_source` falls back to auto-derivation instead of rejecting the feature | The torch path is only used by global refinement |
+| New intermediate nodes that nothing consumes are auto-wired into the output as pass-through features | Otherwise the idea is pruned as unreachable and scored as "no change" |
+| `combine_blocks` names multi-column arrays per column | Fixes width mismatches for multi-column lambdas |
+| Sandbox allow-list gained pure elementwise calls (`log1p`, `sqrt`, `tanh`, `where`, `power`, `exp`, ...), and the allow-list is printed in the engineer prompt | Fewer avoidable sandbox rejections |
+| Sandbox memory limit raised from 512 MB to 8 GB | `RLIMIT_AS` counts virtual address space; NumPy/BLAS reserve a lot of it |
+| Engineer prompt includes the task context, graph semantics (node alternatives compete; output alternatives stack) and "use the column map, never guess indices" | Cuts structurally wrong mutations |
+
+### 4. Readout robustness
+
+- **Extrapolation clipping.** Held-out standardized features are clipped to the training
+  range ±3 (`readout.EXTRAPOLATION_MARGIN`). Columns that are constant relative to their
+  mean are treated as constant. Saturated gates had produced held-out values in the
+  thousands of standard deviations.
+- **SVD fallback.** `_robust_svd` tries NumPy, then SciPy `gesvd`, then a Gram-matrix
+  eigendecomposition, so rank-deficient matrices no longer crash with
+  `SVD did not converge`.
+
+### 5. Kaggle House Prices example
+
+[examples/kaggle_house_prices/](examples/kaggle_house_prices/README.md) contains:
+
+- **`house_prices.py prepare`**: cleaning, ordinal maps, engineered features (TotalSF,
+  ages, baths, porch area, `Has*` flags), one-hot encoding, and strictly positive
+  scaling. It also writes a task context with a per-column profile (type, skew,
+  correlation, text histogram, modality) so the LLM can reason about distributions.
+- **`baseline`**: the seed graph only, no LLM.
+- **`predict`**: refit an evolved graph on all training rows and write a submission CSV.
+- **`run_all.sh`**: the end-to-end pipeline, configurable through environment variables
+  (`STEPS`, `FOLDS`, `PROMOTION`, `SIGN_TEST_ALPHA`, `LLM_URL`, `START_LLM`,
+  `SUBMIT`, ...).
+
+The Kaggle data is not included; the competition rules forbid redistributing it.
+
+### 6. Tests
+
+`tests/test_promotion_sign_test.py` covers the sign test, the veto, advisory widths,
+extrapolation clipping and the SVD fallback. `tests/test_kaggle_house_prices.py`
+covers the example's preparation and prediction path on synthetic frames, so no Kaggle
+data is needed. The example needs pandas: `pip install -e '.[dev,kaggle]'`. Without it,
+those tests are skipped.
+
+Run everything with `pytest -q`.
 
 The implementation focuses on the reusable system design:
 
@@ -289,8 +393,9 @@ the chosen output directory. Memoranda use the paper-style sections
 
 ## Scope
 
-This repository intentionally excludes competition-specific code, hidden benchmark
-logic, and private target-specific feature selection. It is meant as a clean architecture substrate
+The core library intentionally excludes competition-specific code, hidden benchmark
+logic, and private target-specific feature selection. The one exception is the
+self-contained Kaggle example under `examples/`, which this fork adds. It is meant as a clean architecture substrate
 for experiments with open-ended computational graph evolution.
 
 It also does not claim to recover the private 600-step evolved graph. The global
